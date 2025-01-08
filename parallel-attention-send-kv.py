@@ -2,47 +2,12 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from xformers.ops.fmha import memory_efficient_attention_partial, merge_attentions
+from xformers.ops import LowerTriangularMask
 import math
 import nvtx
 from utils import RingComm
 import os
 import time
-
-"""
-Ring Attention just different communication from Blockwise attention,
-only make sense for distributed message passing.
-
-To verify that each hosts received all KV blocks, check out ring-attention-string.py
-
-```bash
-torchrun --nproc_per_node=5 ring-attention-sdpa.py
-```
-
-Output,
-
-```
-0 torch.Size([1, 16, 20, 128])
-4 torch.Size([1, 16, 20, 128])
-1 torch.Size([1, 16, 20, 128])
-2 torch.Size([1, 16, 20, 128])
-3 torch.Size([1, 16, 20, 128])
-```
-
-To verify the integrity of Blockwise attention, check out prefill-sdpa.ipynb
-"""
-
-
-# Returns the result of running `fn()` and the time it took for `fn()` to run,
-# in milliseconds. We use CUDA events and synchronization for the most accurate
-# measurements.
-def timed(fn):
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    result = fn()
-    end.record()
-    torch.cuda.synchronize()
-    return result, start.elapsed_time(end)
 
 
 def gather_attn_output(attn_output):
@@ -64,37 +29,12 @@ def verify_attn_output(
     k_blocks = torch.cat(k_blocks, dim=1)
     v_blocks = torch.cat(v_blocks, dim=1)
     golden_output = F.scaled_dot_product_attention(
-        query=q.transpose(1, 2),
+        query=q_blocks.transpose(1, 2),
         key=k_blocks.transpose(1, 2),
         value=v_blocks.transpose(1, 2),
-        is_causal=False,
+        is_causal=True,
     )
-    torch.testing.assert_close(golden_output, attn_output, atol=1e-3, rtol=1e-3)
-
-
-@torch.compile
-def torch_attention_partial(query, key, value, attn_mask=None):
-    """Perform partial sdpa attention with given inputs"""
-    head_dim = query.size(-1)
-
-    # Scaled Dot-Product Attention
-    attn_weights = torch.matmul(
-        query.transpose(1, 2), key.permute(0, 2, 3, 1)
-    ) / math.sqrt(head_dim)
-
-    if attn_mask is not None:
-        attn_weights = attn_weights + attn_mask
-
-    # Softmax with numerical stability
-    max_vals = torch.max(attn_weights, dim=-1, keepdim=True).values
-    exp_weights = torch.exp(attn_weights - max_vals)
-    sum_exp_weights = torch.sum(exp_weights, dim=-1, keepdim=True)
-    attn_weights = exp_weights / sum_exp_weights
-    lse = torch.log(sum_exp_weights) + max_vals
-
-    output = torch.matmul(attn_weights, value.transpose(1, 2))
-
-    return output.transpose(1, 2), lse.squeeze(-1).to(torch.float32)
+    torch.testing.assert_close(golden_output[:, :], attn_output[:, :], atol=1e-3, rtol=1e-3)
 
 
 def seq_parallel_send_kv(
@@ -116,22 +56,30 @@ def seq_parallel_send_kv(
             next_v: torch.Tensor = comm.send_recv(v)
             comm.commit()
 
-        out_, lse_ = torch_attention_partial(q, k, v)
+        kv_origin = (rank - step) % world_size
 
-        # attn_out is in the shape of [B, M, num of heads, head_dim]
-        o_blocks.append(out_)
+        if kv_origin == rank:
+            out_, lse_ = memory_efficient_attention_partial(q, k, v, attn_bias=LowerTriangularMask())
+        elif kv_origin < rank:
+            out_, lse_ = memory_efficient_attention_partial(q, k, v)
 
-        # LSE is in the shape of [B, num of heads, M]
-        lse_values.append(lse_)
-        # print(f"once {torch.cuda.max_memory_allocated() / 1024**2} MB")
+        if kv_origin <= rank:
+            # attn_out is in the shape of [B, M, num of heads, head_dim]
+            o_blocks.append(out_)
+
+            # LSE is in the shape of [B, num of heads, M]
+            lse_values.append(lse_)
 
         if step + 1 != comm.world_size:
             comm.wait()
             k = next_k
             v = next_v
 
-    with torch.cuda.device(q.device.index):
-        attn_output, _ = merge_attentions(o_blocks, lse_values, write_lse=False)
+    if rank > 0:
+        with torch.cuda.device(q.device.index):
+            attn_output, _ = merge_attentions(o_blocks, lse_values, write_lse=False)
+    else:
+        attn_output = o_blocks[0]
 
     return attn_output
 
@@ -158,16 +106,19 @@ if __name__ == "__main__":
     assert seq_len % world_size == 0, "seq_len must be divisible by world_size"
 
     chunk_len = seq_len // world_size
-    q = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
-    k = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
-    v = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
+    q = torch.rand(batch_size, chunk_len, head_num, dim)
+    k = torch.rand(batch_size, chunk_len, head_num, dim)
+    v = torch.rand(batch_size, chunk_len, head_num, dim)
 
+    # warm up
     attn_output = seq_parallel_send_kv(
         process_group=default_process_group,
         q=q,
         k=k,
         v=v,
     )
+
+    dist.barrier()
 
     # torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
@@ -184,22 +135,17 @@ if __name__ == "__main__":
 
     print(f"RANK {rank}: Time taken: {(end_time - start_time) * 1e3} ms")
 
-    gather_attn_output(attn_output)
+    attn_output = gather_attn_output(attn_output)
 
-    q_blocks = []
-    k_blocks = []
-    v_blocks = []
+    q_blocks = gather_attn_output(q)
+    print("q colleted")
+    k_blocks = gather_attn_output(k)
+    print("k colleted")
+    v_blocks = gather_attn_output(v)
+    print("v colleted")
     if rank == 0:
-        torch.cat([attn_output], dim=1)
-        for rank in range(world_size):
-            q = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
-            k = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
-            v = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
-            q_blocks.append(q)
-            k_blocks.append(k)
-            v_blocks.append(v)
-
-        verify_attn_output(q_blocks, k_blocks, v_blocks, attn_output.transpose(1, 2))
+        attn_output = torch.cat(attn_output, dim=1).transpose(1, 2)
+        verify_attn_output(q_blocks, k_blocks, v_blocks, attn_output)
 
     dist.barrier()
     dist.destroy_process_group()
