@@ -8,42 +8,6 @@ from utils import RingComm
 import os
 import time
 
-"""
-Ring Attention just different communication from Blockwise attention,
-only make sense for distributed message passing.
-
-To verify that each hosts received all KV blocks, check out ring-attention-string.py
-
-```bash
-torchrun --nproc_per_node=5 ring-attention-sdpa.py
-```
-
-Output,
-
-```
-0 torch.Size([1, 16, 20, 128])
-4 torch.Size([1, 16, 20, 128])
-1 torch.Size([1, 16, 20, 128])
-2 torch.Size([1, 16, 20, 128])
-3 torch.Size([1, 16, 20, 128])
-```
-
-To verify the integrity of Blockwise attention, check out prefill-sdpa.ipynb
-"""
-
-
-# Returns the result of running `fn()` and the time it took for `fn()` to run,
-# in milliseconds. We use CUDA events and synchronization for the most accurate
-# measurements.
-def timed(fn):
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    result = fn()
-    end.record()
-    torch.cuda.synchronize()
-    return result, start.elapsed_time(end)
-
 
 def gather_attn_output(attn_output):
     if dist.get_rank() == 0:
@@ -72,33 +36,6 @@ def verify_attn_output(
     torch.testing.assert_close(golden_output, attn_output, atol=1e-3, rtol=1e-3)
 
 
-@torch.compile
-def torch_attention_partial(query, key, value, attn_mask=None):
-    """Perform partial sdpa attention with given inputs"""
-    head_dim = query.size(-1)
-
-    # Scaled Dot-Product Attention
-    attn_weights = torch.matmul(
-        query.transpose(1, 2), key.permute(0, 2, 3, 1)
-    ) / math.sqrt(head_dim)
-
-    if attn_mask is not None:
-        attn_weights = attn_weights + attn_mask
-
-    # Softmax with numerical stability
-    max_vals = torch.max(attn_weights, dim=-1, keepdim=True).values
-    exp_weights = torch.exp(attn_weights - max_vals)
-    sum_exp_weights = torch.sum(exp_weights, dim=-1, keepdim=True)
-    attn_weights = exp_weights / sum_exp_weights
-    lse = torch.log(sum_exp_weights) + max_vals
-
-    output = torch.matmul(attn_weights, value.transpose(1, 2))
-
-    return output.transpose(1, 2).contiguous(), lse.squeeze(-1).to(
-        torch.float32
-    ).contiguous()
-
-
 def seq_parallel_send_q(
     process_group,
     q: torch.Tensor,
@@ -117,7 +54,7 @@ def seq_parallel_send_q(
             next_q: torch.Tensor = comm.send_recv(q)
             comm.commit()
 
-        out_, lse_ = torch_attention_partial(q, k, v)
+        out_, lse_ = memory_efficient_attention_partial(q, k, v)
 
         # attn_out is in the shape of [B, M, num of heads, head_dim]
         o_blocks.append(out_)
@@ -174,6 +111,7 @@ if __name__ == "__main__":
     k = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
     v = torch.ones(batch_size, chunk_len, head_num, dim) * (rank + 1)
 
+    # warm up
     attn_output = seq_parallel_send_q(
         process_group=default_process_group,
         q=q,
@@ -181,7 +119,6 @@ if __name__ == "__main__":
         v=v,
     )
 
-    # torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
     start_time = time.time()
     attn_output = seq_parallel_send_q(
